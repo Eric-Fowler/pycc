@@ -135,8 +135,12 @@ class EfContractionAdapter:
       * ef.einsum is case-sensitive: 'E' != 'e' (pycc uses both). Do NOT lowercase.
       * ef.runner caches the fitted plan per NODE-OBJECT identity, not structurally. Rebuilding a fresh
         node every call replans every call (measured ~1.7 ms vs ~0.46 ms reused). Memoize the node on
-        (clean_spec, shapes, dtype) and reuse the SAME object across iterations; reusing the runner is
-        not enough.
+        (clean_spec, shapes, per_operand_dtypes) and reuse the SAME object across iterations; reusing the
+        runner is not enough.
+      * Key on PER-OPERAND dtypes, not np.result_type: distinct mixed-width operand combinations can
+        share a result_type yet are genuinely different node invocations. Layout/view class is NOT in
+        this key — layout is runtime storage, not contraction identity; it is recorded by A0 instead
+        (§4) and its irrelevance to the node cache is pinned by a regression test.
     """
 
     def __init__(self, capacity=1 << 34, device="cpu", oracle=False):
@@ -145,10 +149,12 @@ class EfContractionAdapter:
 
     def __call__(self, subscripts, *operands):
         spec = "".join(subscripts.split())          # robust whitespace normalization; case preserved
+        if "->" not in spec:                        # A0 asserts the PyCC corpus is all explicit-output;
+            raise ValueError(f"implicit-output einsum not supported: {subscripts!r}")  # fail loud, not IndexError
         out = spec.split("->")[1]
         shapes = tuple(tuple(np.shape(o)) for o in operands)
-        dtype = np.result_type(*[np.asarray(o).dtype for o in operands])
-        key = (spec, shapes, dtype)
+        dtypes = tuple(np.asarray(o).dtype.str for o in operands)   # per-operand, not result_type
+        key = (spec, shapes, dtypes)
         node, arrs = self._cache.get(key, (None, None))
         if node is None:
             arrs = [ef.array(shapes[i], f"op{i}") for i in range(len(operands))]
@@ -165,8 +171,8 @@ class EfContractionAdapter:
 **Two limitations to state plainly:**
 
 1. **This seam does not expose EF's CSE/planner potential, and must not be described as if it did.** The
-   `(clean_spec, shapes, dtype)` memoization stabilizes node identity for *that one PyCC call
-   signature*. It does **not** reproduce the semantic leaf identity and whole-expression
+   `(clean_spec, shapes, per_operand_dtypes)` memoization stabilizes node identity for *that one PyCC
+   call signature*. It does **not** reproduce the semantic leaf identity and whole-expression
    canonicalization EF gets when an equation is built **once** as a frontend graph (where shared leaves
    and α-equivalent monomials across *different* terms collapse to shared nodes). Cross-term CSE,
    materialize-vs-fuse, and residency are program-level properties this per-call seam structurally
@@ -182,11 +188,23 @@ Keep the CPU/DP restriction throughout.
 ## 4. Two tracks (run in parallel; they answer different questions)
 
 ### Track A — drop-in compatibility seam (harness / regression)
-- **A0.** Capture real PyCC contraction signatures `(clean_spec, shapes, dtype)` from one small CCSD run
-  (water/cc-pVDZ, `test_002`) via a flag-guarded logging shim (off by default), then **replay them
-  offline** against `ef.evaluate` and `ef.runner`, comparing to `opt_einsum`/`np.einsum` at a stated
-  tolerance. Output: a coverage report of what EF computes correctly + a ranked gap list (§6).
-  `pycc/tests/test_024_contract_cpu.py` is the natural pattern/home.
+- **A0.** Capture real PyCC contraction signatures via a flag-guarded logging shim (off by default) from
+  one small CCSD run (water/cc-pVDZ, `test_002`), then **replay them offline** against `ef.evaluate` and
+  `ef.runner`, comparing to `np.einsum` at a stated tolerance. Capture **per-invocation, per-operand**
+  metadata, not a collapsed `(spec, shapes, result_dtype)`:
+  - `clean_spec` (whitespace-normalized, case preserved);
+  - `per_operand_shapes`;
+  - `per_operand_dtypes`;
+  - `per_operand_layout` — minimally `C-contiguous` / `F-contiguous` / `non-contiguous` (ndim/strides if
+    cheap). Production tensor *values* are never serialized; the replay harness generates random values
+    and reconstructs a representative view matching the captured layout, so the §7 non-contiguous
+    coverage target is actually exercised.
+  A0 must also **answer the implicit-output question empirically**: does the real PyCC corpus contain any
+  spec without `->`? If none, assert that invariant and report it; if any, normalize NumPy implicit-
+  output semantics during capture. Never leave a silent `IndexError`. Output: a coverage report of what
+  EF computes correctly + a ranked gap list (§6). `pycc/tests/test_024_contract_cpu.py` is the natural
+  pattern/home, plus a regression test pinning **layout-independence of the node cache** (same cached
+  node, contiguous and non-contiguous operands → same result).
 - **A1.** Optional CPU/DP `ef.runner` backend behind a flag for *one* CCSD energy test (`test_002`),
   off by default. Its benchmark stays explicitly labeled **"per-contraction adapter performance"** — it
   is *not* a benchmark of EF program-native execution.
@@ -195,18 +213,39 @@ Keep the CPU/DP restriction throughout.
 
 ### Track B — program-native PyCC integration (the real experiment)
 Do **not** make Track B wait on Track A widening to lambda/density/response/EOM — they answer different
-questions. The EF CCSD implementation proves the APIs needed to prototype B0 already exist, so this is
-**not** "pending EF program features maturing"; the composed-program mechanism is present and exercised
-(there may still be performance/integration gaps, which is exactly what B measures).
-- **B0.** Build **one narrow PyCC vertical slice at an equation/iteration boundary** — e.g. one residual
-  plus the denominator/Jacobi update — expressed with **stable `ef.array` leaves** and **one composed
-  `ef.program`**, numerically checked against existing PyCC. This is dozens of leaves and a handful of
-  roots, **not** 1776 individual calls. `assemble.py` is the architectural template.
-- **B1.** Measure **cold planning/compile separately from warm iteration wall time and peak memory** —
-  break out IR/node construction, planning, compilation, first execution, warm execution, whole-
-  iteration wall time, and peak memory/transfers where available. (EF's own note: search "costs minutes
-  per program today — TZ 239 s for ~8 s saved over a 16-iteration run," so cold-vs-warm and decision
-  persistence dominate the verdict.)
+questions. The EF CCSD implementation proves the composed-program APIs needed to prototype B0 already
+exist and are exercised, so this is **not** "pending EF program features maturing" (there may still be
+performance/integration gaps — that is what B measures).
+
+**B0 is defined against PyCC's *own* equations, not EF's DF-CCSD example.** PyCC's CCSD residual path
+builds its own intermediates (`Fae`, `Fmi`, `Fme`, `Wmnij`, `Wmbej`, `Wmbje`, `Zmbij`) then `r_T1`/`r_T2`
+(`ccwfn.py`), and the Jacobi update lives *outside* `residuals` as `self.t1 += r1/Dia`,
+`self.t2 += r2/Dijab`. B0 re-expresses a **PyCC** equation slice with PyCC's current tensors; do **not**
+import/adapt EF's t1-dressed DF-CCSD graph and call it the PyCC experiment.
+
+- **B0 (scope — choose explicitly).**
+  - *Preferred (meaningful):* the PyCC **T2 residual path + `t2 += r2/Dijab`**, including the
+    intermediates `r_T2` depends on, expressed as one composed `ef.program` — this exercises the
+    dominant tensor work, reusable intermediates, accumulation, and the update boundary (the things
+    Track B exists to test).
+  - *Fallback (plumbing only):* the PyCC **T1 residual + `t1 += r1/Dia`** — smaller, but label it
+    explicitly a **correctness/plumbing milestone, not a planner-performance verdict**.
+  Prefer T2 if it stays reasonably isolated; drop to T1 if it balloons.
+- **B0 numerical-comparison contract.** For one *fixed* PyCC state `(F, ERI/L, t1, t2, denominators)`:
+  (1) evaluate the existing PyCC path, save its residual/update result; (2) feed the *same* numerical
+  inputs to the EF program; (3) align axes by name at the EF boundary; (4) compare **residual** and
+  **post-Jacobi amplitude separately**; (5) involve **no DIIS, no convergence history, no second CC
+  iteration** — this isolates an equation mismatch immediately instead of hiding it behind iterative
+  convergence.
+- **B0 planner mode is frozen.** The first B0 correctness/perf baseline uses EF's **declared/default
+  program placement with planner search DISABLED** (`precompile(..., search=False)`), so two B0
+  implementations can't reach incomparable conclusions (one paying the ~239 s search, one not).
+- **B1a.** Cold/warm benchmark of that fixed `search=False` baseline — break out IR/node construction,
+  planning, compilation, first (cold) execution, warm execution, whole-iteration wall time, and peak
+  memory/transfers where available.
+- **B1b.** *Optional* `search=True` experiment, reported **separately**, with search time and the
+  resulting decision fingerprint recorded. (Persistence/amortization of that search is an upstream EF
+  concern, not a PyCC deliverable.)
 - **B2.** Only after correctness, try an **EF-owned GPU execution path** for that region (§5).
 
 ---
