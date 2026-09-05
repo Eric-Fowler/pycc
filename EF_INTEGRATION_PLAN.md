@@ -251,12 +251,18 @@ import/adapt EF's t1-dressed DF-CCSD graph and call it the PyCC experiment.
 - **B1a.** Cold/warm benchmark of that fixed `search=False` baseline. **Comparator:** a *T2-only*
   production PyCC region (`build_* → cc.r_T2 → t2 + r2/cc.Dijab` on `cc.contract`/opt_einsum), **not**
   `cc.residuals()` (which also computes `r_T1` and would over-charge PyCC); `cc.r_T2` already
-  symmetrizes so it equals the authority `cc.residuals(...)[1]` while doing only T2 work. Break out, as
+  symmetrizes so it equals the authority `cc.residuals(...)[1]` while doing only T2 work — the harness
+  **asserts both the comparator and the EF slice against that authority in code before timing**.
+  **Denominator fairness:** the EF benchmark build uses `denom="dijab"` and consumes PyCC's precomputed
+  `cc.Dijab` (built once at construction) via an invariant leaf, so EF is not charged for per-pass
+  denominator construction PyCC never repeats (`denom="eps"` stays the correctness build). Break out, as
   separate phases (never one opaque `Slice.run` number): EF IR/program build, runner construction,
   `precompile`, first (cold) execution, and a warm loop that **reuses the same Slice/program/runner/
-  precompiled plan** (no rebuild, no precompile) — only the warm distribution is compared. Report peak/
-  planned memory separately where trustworthy. Harness: `devtools/ef_integration/b0/bench_t2.py`, gated
-  on the psi4 production comparison being green before any number is interpreted.
+  precompiled plan** (no rebuild, no precompile) — only the warm distribution is compared. Run the timed
+  section under an explicit `threadpool_limits(threads)` and record the CPU-thread policy + environment;
+  warm both sides then **alternate** timed samples. Report peak/planned memory separately where
+  trustworthy. Harness: `devtools/ef_integration/b0/bench_t2.py`, gated on the psi4 production comparison
+  being green before any number is interpreted.
 - **B1b.** *Optional* `search=True` experiment (the one that actually tests alternate
   materialize-vs-fuse decisions), reported **separately**, with search time and the resulting decision
   fingerprint recorded. (Persistence/amortization of that search is an upstream EF concern.)

@@ -67,3 +67,16 @@ def test_composed_residual_and_update_program(fixture):
 def test_residual_is_p_symmetric(fixture):
     _s, r2, _t2t, _sl = fixture
     assert np.allclose(r2, r2.swapaxes(0, 1).swapaxes(2, 3))  # P(ij)(ab)
+
+
+def test_dijab_mode_matches_mirror(fixture):
+    """The B1a fairness build (denom='dijab', precomputed Dijab leaf) must produce the
+    same residual and update as the eps-mode correctness build / the mirror."""
+    s, r2, t2t, _sl = fixture
+    sl_d = R2mod.build(O, V, denom="dijab")
+    r2_o, t2t_o = sl_d.evaluate_oracle(s)          # s already carries "Dijab"
+    assert np.allclose(r2_o, r2)
+    assert np.allclose(t2t_o, t2t)
+    r2_p, t2t_p = sl_d.run(s, ef.runner(1 << 30, device="cpu"), search=False)
+    assert np.allclose(r2_p, r2)
+    assert np.allclose(t2t_p, t2t)

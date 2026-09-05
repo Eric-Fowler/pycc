@@ -109,6 +109,8 @@ def random_state(o: int, v: int, seed: int = 0) -> dict:
     rng = np.random.default_rng(seed)
     eps_o = np.sort(rng.uniform(-1.0, -0.3, size=o))
     eps_v = np.sort(rng.uniform(0.3, 1.5, size=v))
+    Dijab = (eps_o[:, None, None, None] + eps_o[None, :, None, None]
+             - eps_v[None, None, :, None] - eps_v[None, None, None, :])  # == PyCC cc.Dijab
     R = rng.standard_normal
     return {
         "t1": R((o, v)) * 1e-2, "t2": R((o, o, v, v)) * 1e-2,
@@ -118,5 +120,5 @@ def random_state(o: int, v: int, seed: int = 0) -> dict:
         "ERI_ovvv": R((o, v, v, v)), "ERI_ovvo": R((o, v, v, o)), "ERI_ovov": R((o, v, o, v)),
         "ERI_vvvv": R((v, v, v, v)), "ERI_vvvo": R((v, v, v, o)), "ERI_ovoo": R((o, v, o, o)),
         "ERI_vvoo": R((v, v, o, o)), "ERI_oovv": R((o, o, v, v)),
-        "eps_o": eps_o, "eps_v": eps_v,
+        "eps_o": eps_o, "eps_v": eps_v, "Dijab": Dijab,
     }

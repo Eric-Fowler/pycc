@@ -74,18 +74,32 @@ The harness is written but its numbers must **not** be interpreted until the psi
 production gate (`against_pycc_t2.py`) is green (`bench_t2.main` enforces this order:
 it runs the correctness comparison first and refuses to report timings if it fails).
 
-Two contract points it gets right:
-- **Apples-to-apples comparator:** a T2-ONLY production region
+Four contract points it gets right:
+- **Apples-to-apples comparator, pinned in code:** a T2-ONLY production region
   (`build_* → cc.r_T2 → t2 + r2/cc.Dijab` on `cc.contract`/opt_einsum), **not**
-  `cc.residuals()` (which also computes `r_T1` and would over-charge PyCC). `cc.r_T2`
-  already symmetrizes, so this equals the correctness authority `cc.residuals(...)[1]`
-  while doing only T2 work. The authority stays `cc.residuals(...)[1]`; the
-  *comparator* is this T2-only region.
+  `cc.residuals()` (which also computes `r_T1` and would over-charge PyCC). Before any
+  timing, the harness asserts **both** the comparator and the EF slice equal the
+  authority `cc.residuals(...)[1]` (and `cc.t2 + r2/cc.Dijab`) — so the fact that
+  `cc.r_T2` symmetrizes is pinned in code, not assumed, and survives a later
+  `r_T2`/`residuals` refactor.
+- **Denominator fairness:** the EF benchmark build is `denom="dijab"`, consuming
+  PyCC's **precomputed** `cc.Dijab` (built once at wavefunction construction) via an
+  invariant leaf, so EF is not charged for denominator construction PyCC never
+  repeats. Per-pass work is then equivalent: `r2 + reciprocal/multiply of a
+  precomputed denominator` on both sides. (`denom="eps"`, which builds `Dijab`
+  in-graph from orbital energies, stays the B0 correctness/denominator-equivalence
+  evidence — unchanged.)
 - **Lifecycle split, not one opaque number:** `Slice.precompile()` and
   `Slice.execute()` are separate, so the harness times EF IR/program build, runner
   construction, `precompile(search=False)`, first (cold) execute, and a **warm loop
   that reuses the same Slice/program/runner/precompiled plan** (no rebuild, no
-  precompile). Only the warm distribution is compared to the PyCC T2 region.
+  precompile). Only the warm distribution is compared.
+- **Thread policy + fair sampling:** the timed section runs under an explicit
+  `threadpool_limits(threads)` (default 1) and the report records threads,
+  `threadpool_info`, platform, numpy/opt_einsum versions, the EF pin and capacity, so
+  a ratio isn't secretly a thread-runtime artifact. EF and PyCC are both warmed, then
+  their timed samples **alternate order** to avoid fixed-order thermal/frequency bias;
+  the raw samples + quartiles are kept in the report.
 
 ## GPU / B2 note — do not canonize the B0 host boundary
 For B0 correctness, host-reading `R2` is useful (it lets the residual be compared

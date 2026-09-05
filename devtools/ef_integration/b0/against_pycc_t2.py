@@ -33,6 +33,7 @@ def extract_inputs(cc) -> dict:
         "ERI_ovoo": np.asarray(ERI[o, v, o, o]), "ERI_vvoo": np.asarray(ERI[v, v, o, o]),
         "ERI_oovv": np.asarray(ERI[o, o, v, v]),
         "eps_o": np.asarray(cc.H.eps[o]), "eps_v": np.asarray(cc.H.eps[v]),
+        "Dijab": np.asarray(cc.Dijab),   # PyCC's precomputed denominator (for the dijab-mode B1a build)
     }
     return blk
 

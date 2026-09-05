@@ -1,37 +1,61 @@
 """B1a benchmark harness for the T2 slice — authored ahead, DO NOT interpret its
 numbers until the psi4 production-equivalence gate (against_pycc_t2.py) is green.
 
-Two things this gets right, per the review:
+Contract points, per review:
 
-1. **Apples-to-apples PyCC comparator.** NOT ``cc.residuals()`` (which also computes
+1. **Apples-to-apples comparator.** NOT ``cc.residuals()`` (which also computes
    r_T1 and would over-charge PyCC). The comparator is a T2-ONLY production region
-   built from PyCC's own methods with the same seven intermediate productions, the
-   same symmetrized r_T2, and the same Jacobi update, run on ``cc.contract`` /
-   opt_einsum:
+   (``build_* -> cc.r_T2 -> t2 + r2/cc.Dijab`` on ``cc.contract``/opt_einsum). Before
+   timing, both the comparator AND the EF slice are asserted equal to the production
+   authority ``cc.residuals(...)[1]`` — the benchmark pins that in code rather than
+   relying on review-time knowledge that ``cc.r_T2`` symmetrizes.
 
-       Fae..Zmbij = cc.build_*(...)
-       r2 = cc.r_T2(o, v, F, ERI, t1, t2, Fae, Fme, Fmi, Wmnij, Wmbej, Wmbje, Zmbij)
-       t2_trial = t2 + r2 / cc.Dijab
+2. **Denominator fairness.** The EF benchmark build uses ``denom="dijab"``: it
+   consumes PyCC's precomputed ``cc.Dijab`` (built once at wavefunction construction)
+   instead of rebuilding ``Dijab`` from orbital energies every pass. So the per-pass
+   work is the same on both sides: ``r2 + division/reciprocal-multiply by a
+   precomputed denominator``. (The ``denom="eps"`` graph stays the B0 correctness
+   evidence.)
 
-   (``cc.r_T2`` already applies the P(ij)(ab) symmetrization, so this equals
-   ``cc.residuals(...)[1]`` — the correctness authority — while doing only T2 work.)
+3. **Lifecycle split, not one opaque number.** ``Slice.precompile`` / ``Slice.execute``
+   are separate; the warm loop reuses the same Slice/program/runner/precompiled plan
+   (no rebuild, no precompile). Only the warm distribution is compared.
 
-2. **Lifecycle split, not one opaque number.** ``Slice.run`` calls ``precompile``
-   internally; timing repeated ``run`` calls would fold planning into every sample.
-   This times, separately: EF IR/program build, runner construction,
-   precompile(search=False), first begin_pass+execute, and a warm loop that reuses
-   the same Slice / program / runner / already-precompiled plan (no rebuild, no
-   precompile). Only the warm distribution is compared to the PyCC T2 region.
+4. **Thread policy + fair sampling.** The whole timed section runs under an explicit
+   ``threadpool_limits(threads)`` when available, and the environment (threads,
+   threadpool_info, platform, numpy/opt_einsum versions, EF pin, capacity) is recorded
+   so a ratio isn't secretly a thread-runtime artifact. EF and PyCC are both warmed,
+   then their timed samples alternate order to avoid fixed-order thermal/frequency bias.
 
-``search=False`` throughout: this measures the declared-cut materialization baseline
-(the default value of the materialize-vs-fuse DoF), not the planner's search. The
-search=True experiment is B1b, reported separately.
+``search=False`` throughout (declared-cut materialization baseline, not
+materialize-vs-fuse search — that is B1b).
 """
 
 from __future__ import annotations
 
+import platform
 import statistics
 import time
+
+import numpy as np
+
+EF_PIN = "da4d2d9"  # ehrenfest claude/tiling-from-scratch pin (see EF_INTEGRATION_PLAN.md §8)
+
+try:
+    from threadpoolctl import threadpool_limits, threadpool_info
+    _HAVE_TPC = True
+except Exception:  # threadpoolctl not installed in this env
+    _HAVE_TPC = False
+
+    class _NullLimits:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    def threadpool_limits(limits=None):  # noqa: D401 - shim
+        return _NullLimits()
+
+    def threadpool_info():
+        return None
 
 
 def pycc_t2_region(cc):
@@ -55,21 +79,45 @@ def pycc_t2_region(cc):
     return run_once
 
 
-def _time(fn, repeats: int):
-    ts = []
-    for _ in range(repeats):
-        t0 = time.perf_counter()
-        fn()
-        ts.append(time.perf_counter() - t0)
-    return ts
+def _authority(cc):
+    """Production PyCC residual/update — the correctness authority both timed sides
+    are pinned to before any timing."""
+    _r1, r2 = cc.residuals(cc.H.F, cc.t1, cc.t2)
+    r2 = np.asarray(r2)
+    return r2, np.asarray(cc.t2) + r2 / np.asarray(cc.Dijab)
 
 
-def benchmark(cc, capacity: int = 1 << 32, warm: int = 25, pycc_warm: int = 25) -> dict:
+def _timed(fn):
+    t0 = time.perf_counter()
+    fn()
+    return time.perf_counter() - t0
+
+
+def _env(threads, capacity):
+    info = {
+        "threads": threads,
+        "threadpool_info": threadpool_info() if _HAVE_TPC else "threadpoolctl-unavailable",
+        "platform": platform.platform(),
+        "numpy": np.__version__,
+        "ef_pin": EF_PIN,
+        "capacity": capacity,
+    }
+    try:
+        import opt_einsum
+        info["opt_einsum"] = opt_einsum.__version__
+    except Exception:
+        info["opt_einsum"] = None
+    return info
+
+
+def benchmark(cc, capacity: int = 1 << 32, warm: int = 25, warmup: int = 3,
+              threads: int | None = 1, rtol: float = 1e-9, atol: float = 1e-11) -> dict:
     """Run the B1a lifecycle-split benchmark against a live PyCC state.
 
-    Returns a report with each EF lifecycle phase, the PyCC T2-region distribution,
-    and the warm speed ratio. Correctness is NOT re-asserted here — that is the
-    production gate's job; call it first.
+    Pins both timed sides to the production authority, then times under an explicit
+    thread policy with alternating EF/PyCC samples. Returns a report; correctness is
+    asserted (raises on mismatch) but not re-reported as the deliverable — the psi4
+    gate remains the authority.
     """
     import ehrenfest as ef
     from . import residual_t2 as R2mod
@@ -78,44 +126,73 @@ def benchmark(cc, capacity: int = 1 << 32, warm: int = 25, pycc_warm: int = 25) 
     inp = extract_inputs(cc)
     o, v = int(cc.no), int(cc.nv)
 
-    # --- EF lifecycle, timed in phases ---
+    r2_auth, t2_auth = _authority(cc)
+
+    # --- comparator pinned to the authority (fix 2): pycc_t2_region == cc.residuals ---
+    region = pycc_t2_region(cc)
+    r2_reg, t2_reg = region()
+    np.testing.assert_allclose(np.asarray(r2_reg), r2_auth, rtol=rtol, atol=atol,
+                               err_msg="pycc_t2_region residual != cc.residuals(...)[1]")
+    np.testing.assert_allclose(np.asarray(t2_reg), t2_auth, rtol=rtol, atol=atol,
+                               err_msg="pycc_t2_region update != authority")
+
+    # --- EF lifecycle, timed in phases (fix 3), fairness build denom='dijab' (fix 1) ---
     t0 = time.perf_counter()
-    sl = R2mod.build(o, v)                       # IR / program build
+    sl = R2mod.build(o, v, denom="dijab")
     ef_build = time.perf_counter() - t0
 
     t0 = time.perf_counter()
-    run = ef.runner(capacity, device="cpu")      # runner construction
+    run = ef.runner(capacity, device="cpu")
     ef_runner_ctor = time.perf_counter() - t0
 
     t0 = time.perf_counter()
-    sl.precompile(run, search=False)             # planning (declared-cut baseline)
+    sl.precompile(run, search=False)
     ef_precompile = time.perf_counter() - t0
 
     t0 = time.perf_counter()
-    sl.execute(run, inp)                         # first (cold) execution
+    r2_ef, t2_ef = sl.execute(run, inp)     # first (cold) execution
     ef_first_exec = time.perf_counter() - t0
 
-    ef_warm = _time(lambda: sl.execute(run, inp), warm)   # reuses plan; no precompile
+    # EF slice pinned to the authority too (the exact graph being benchmarked)
+    np.testing.assert_allclose(np.asarray(r2_ef), r2_auth, rtol=rtol, atol=atol,
+                               err_msg="ef dijab-mode residual != authority")
+    np.testing.assert_allclose(np.asarray(t2_ef), t2_auth, rtol=rtol, atol=atol,
+                               err_msg="ef dijab-mode update != authority")
 
-    # --- PyCC T2-only production region ---
-    region = pycc_t2_region(cc)
-    region()                                     # warm caches (opt_einsum path/threads)
-    pycc_warm_ts = _time(region, pycc_warm)
+    # --- warm timing: both warmed, then alternating timed samples (fix 4) ---
+    ef_samples: list = []
+    pycc_samples: list = []
+    with threadpool_limits(limits=threads):
+        for _ in range(warmup):
+            sl.execute(run, inp)
+            region()
+        for k in range(warm):
+            if k % 2 == 0:
+                ef_samples.append(_timed(lambda: sl.execute(run, inp)))
+                pycc_samples.append(_timed(region))
+            else:
+                pycc_samples.append(_timed(region))
+                ef_samples.append(_timed(lambda: sl.execute(run, inp)))
 
-    ef_med = statistics.median(ef_warm)
-    pycc_med = statistics.median(pycc_warm_ts)
+    def dist(xs):
+        q = statistics.quantiles(xs, n=4) if len(xs) >= 2 else [xs[0], xs[0], xs[0]]
+        return {"median": statistics.median(xs), "min": min(xs), "max": max(xs),
+                "q1": q[0], "q3": q[2], "n": len(xs), "samples": xs}
+
+    ef_d, pycc_d = dist(ef_samples), dist(pycc_samples)
     return {
         "shape": {"o": o, "v": v},
+        "environment": _env(threads, capacity),
         "ef_build_s": ef_build,
         "ef_runner_ctor_s": ef_runner_ctor,
         "ef_precompile_s": ef_precompile,
         "ef_first_exec_s": ef_first_exec,
-        "ef_warm_s": {"median": ef_med, "min": min(ef_warm), "max": max(ef_warm), "n": warm},
-        "pycc_t2_region_s": {"median": pycc_med, "min": min(pycc_warm_ts),
-                             "max": max(pycc_warm_ts), "n": pycc_warm},
-        "warm_ratio_ef_over_pycc": (ef_med / pycc_med) if pycc_med else None,
-        "note": "search=False (declared-cut materialization baseline); warm reuses one "
-                "precompiled program. Interpret only after the psi4 production gate is green.",
+        "ef_warm_s": ef_d,
+        "pycc_t2_region_s": pycc_d,
+        "warm_ratio_ef_over_pycc": ef_d["median"] / pycc_d["median"] if pycc_d["median"] else None,
+        "note": "search=False declared-cut baseline; denom=dijab (precomputed cc.Dijab); "
+                "warm reuses one precompiled program; both sides pinned to cc.residuals(...)[1] "
+                "before timing. Interpret only after the psi4 production gate is green.",
     }
 
 
@@ -123,7 +200,7 @@ def main() -> int:
     from .against_pycc import build_pycc_state
     from .against_pycc_t2 import compare_against_pycc
     cc = build_pycc_state()
-    gate = compare_against_pycc(cc)     # correctness authority FIRST
+    gate = compare_against_pycc(cc)     # correctness authority FIRST (staged, eps-mode)
     inter_ok = all(v["ok"] for v in gate["intermediates"].values())
     if not (inter_ok and gate["residual_ok"] and gate["update_ok"]):
         print("PRODUCTION GATE FAILED — refusing to report timings:", gate)

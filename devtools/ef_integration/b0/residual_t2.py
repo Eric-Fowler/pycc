@@ -33,8 +33,10 @@ LEAF_SHAPES = {
     "ERI_ovvv": ("o", "v", "v", "v"), "ERI_ovvo": ("o", "v", "v", "o"), "ERI_ovov": ("o", "v", "o", "v"),
     "ERI_vvvv": ("v", "v", "v", "v"), "ERI_vvvo": ("v", "v", "v", "o"), "ERI_ovoo": ("o", "v", "o", "o"),
     "ERI_vvoo": ("v", "v", "o", "o"), "ERI_oovv": ("o", "o", "v", "v"),
-    "eps_o": ("o",), "eps_v": ("v",),
 }
+# denominator-source leaves are added per mode (see build(denom=...)):
+#   "eps"   -> eps_o (o,), eps_v (v,)         [B0 correctness: builds Dijab in-graph]
+#   "dijab" -> Dijab (o,o,v,v), invariant     [B1a fairness: consumes PyCC's precomputed cc.Dijab]
 
 
 def _transposed(value, node, letters):
@@ -85,7 +87,20 @@ class Slice:
         return r2, t2t
 
 
-def build(o: int, v: int) -> Slice:
+def build(o: int, v: int, denom: str = "eps") -> Slice:
+    """Build the T2 slice. ``denom`` selects the Jacobi-denominator source:
+
+    * ``"eps"`` (default, B0 correctness) — leaves ``eps_o``/``eps_v``; the program
+      builds ``Dijab = eps_i + eps_j - eps_a - eps_b`` and its reciprocal each pass.
+      This keeps the denominator-equivalence evidence (eps-derived == PyCC ``Dijab``).
+    * ``"dijab"`` (B1a fairness) — an invariant leaf ``Dijab`` fed PyCC's precomputed
+      ``cc.Dijab`` (which PyCC builds once at construction, not per iteration); the
+      program does only the fused reciprocal/multiply. This makes the per-pass work
+      equivalent to production PyCC (``r2 + division by a precomputed denominator``)
+      instead of charging EF for denominator construction PyCC never repeats.
+    """
+    if denom not in ("eps", "dijab"):
+        raise ValueError(f"denom must be 'eps' or 'dijab', got {denom!r}")
     ext = {"o": o, "v": v}
     L = {name: ef.array(tuple(ext[s] for s in shp), name) for name, shp in LEAF_SHAPES.items()}
     t1, t2 = L["t1"], L["t2"]
@@ -153,18 +168,27 @@ def build(o: int, v: int) -> Slice:
     R2 = ef.cut(ef.einsum("ijab->ijab", R2raw) + ef.einsum("jiba->ijab", R2raw), "ijab", "R2")
 
     # --- fused Jacobi update: t2_trial = t2 + R2 * 1/Dijab ---
-    e2 = {"a": v, "b": v, "i": o, "j": o}
+    denom_items = []
+    if denom == "eps":
+        L["eps_o"] = ef.array((o,), "eps_o")
+        L["eps_v"] = ef.array((v,), "eps_v")
+        e2 = {"a": v, "b": v, "i": o, "j": o}
 
-    def bc(e, own):
-        return ef.broadcast(e, {ll: n for ll, n in e2.items() if ll != own})
+        def bc(e, own):
+            return ef.broadcast(e, {ll: n for ll, n in e2.items() if ll != own})
 
-    Dsum2 = ef.cut(bc(L["eps_o"].at("i"), "i") + bc(L["eps_o"].at("j"), "j")
-                   - bc(L["eps_v"].at("a"), "a") - bc(L["eps_v"].at("b"), "b"), "ijab", "Dsum2")
-    Dinv2 = ef.map(Dsum2, "reciprocal")
+        Dsum2 = ef.cut(bc(L["eps_o"].at("i"), "i") + bc(L["eps_o"].at("j"), "j")
+                       - bc(L["eps_v"].at("a"), "a") - bc(L["eps_v"].at("b"), "b"), "ijab", "Dsum2")
+        Dinv2 = ef.map(Dsum2, "reciprocal")
+        denom_items = [Dsum2]
+    else:  # "dijab": consume PyCC's precomputed denominator (built once, not per pass)
+        L["Dijab"] = ef.array((o, o, v, v), "Dijab", invariant=True)
+        Dinv2 = ef.map(L["Dijab"], "reciprocal")
+
     t2_trial = (t2.at("ijab") + ef.einsum("ijab,ijab->ijab", R2, Dinv2)).node("ijab")
 
     items = [tau11, tau1h, tauh1, Fae, Fmi, Fme, Wmnij, Wmbej, Wmbje, Zmbij,
-             Dsum2, R2raw, R2, t2_trial]
+             *denom_items, R2raw, R2, t2_trial]
     program = ef.program(items, host=["R2"])
     inter = {"Fae": Fae, "Fmi": Fmi, "Fme": Fme, "Wmnij": Wmnij,
              "Wmbej": Wmbej, "Wmbje": Wmbje, "Zmbij": Zmbij}
