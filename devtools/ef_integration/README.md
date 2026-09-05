@@ -40,13 +40,18 @@ The capture hook (`pycc/device.py`, `ContractionBackend.__call__`) is off unless
 `PYCC_EF_CAPTURE` is set and never perturbs the returned value.
 
 ## Observed so far (against ehrenfest `claude/tiling-from-scratch` @ da4d2d9)
-Static inventory of the corpus: **1907 literal einsum specs, 858 distinct**;
-arity {1: 11, 2: 1846, 3: 49, 4: 1}; 66 specs use uppercase indices; 4 carry
-whitespace; **every literal spec is explicit-output** (implicit-output invariant
-holds → the adapter's loud rejection is safe).
+AST inventory of the corpus (`static_corpus.py` walks every `contract(...)` call and
+inspects argument zero, so both quote styles and adjacent-literal concatenation are
+covered and non-literal first args are reported, not assumed): **1948 `contract()`
+call expressions → 1946 literal einsum specs, 862 distinct**; arity
+{1: 11, 2: 1879, 3: 55, 4: 1}; 67 use uppercase indices; 29 carry whitespace; the
+**only 2 non-literal calls are `device.py`'s own `opt_einsum.contract(subscripts, …)`
+forwarding**, so the whole real corpus is literal and **every literal spec is
+explicit-output** (implicit-output invariant holds → the adapter's loud rejection is
+safe).
 
 Offline replay (`--from-corpus --extent 3 --runner`, C + non-contiguous passes):
-**all 858 distinct specs OK through both `ef.evaluate` and `ef.runner`.** Caveats:
+**all 862 distinct specs OK through both `ef.evaluate` and `ef.runner`.** Caveats:
 uniform synthetic extent 3, DP real only — this covers the *index patterns* of the
 corpus, not real extents, mixed precision, or complex (RT-CC) dtypes. Those need
 the live capture above (and complex is a known `ef.runner` gap, §6 of the plan).

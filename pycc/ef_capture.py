@@ -27,8 +27,10 @@ This module owns these definitions; the offline tools under
 
 from __future__ import annotations
 
+import atexit
 import json
 import os
+import sys
 import threading
 
 import numpy as np
@@ -73,17 +75,29 @@ def _dedup_key(sig: dict):
 
 
 class SignatureRecorder:
-    """Append unique contraction signatures to a JSONL file, with occurrence counts.
+    """Aggregate unique contraction signatures with correct occurrence counts.
 
-    One line per unique ``(clean_spec, shapes, dtypes, layouts)``, carrying a
-    running ``count``. Thread-safe and best-effort: recording never raises into
-    the caller's contraction (a capture failure must never perturb a real run).
+    One JSONL line per unique ``(clean_spec, shapes, dtypes, layouts)`` carrying a
+    running ``count``. Counts are held in memory and written by :meth:`flush`; the
+    file is (re)written atomically on a periodic batch threshold and, crucially, on
+    :meth:`close` — which :func:`maybe_record` registers with :mod:`atexit`, so the
+    final counts always land regardless of when the last new signature appeared
+    (the earlier flush-only-on-new-signature bug left duplicate occurrences that
+    arrived after the last unique one unpersisted).
+
+    Best-effort: recording never raises into the caller's contraction, but capture
+    failures are collected (``.errors``), surfaced once on stderr, and written to a
+    ``<path>.errors`` sidecar on flush, so an unwritable path or a bad operand can
+    never masquerade as a clean empty/partial capture.
     """
 
-    def __init__(self, path: str):
+    def __init__(self, path: str, flush_every: int = 2000):
         self.path = path
+        self.flush_every = flush_every
         self._seen: dict = {}
         self._lock = threading.Lock()
+        self._since_flush = 0
+        self.errors: list = []
 
     def record(self, subscripts: str, operands) -> None:
         try:
@@ -94,19 +108,40 @@ class SignatureRecorder:
                 if entry is None:
                     sig["count"] = 1
                     self._seen[key] = sig
-                    self._flush()
                 else:
                     entry["count"] += 1
-        except Exception:
-            # Capture is a diagnostic; it must never break a contraction.
-            pass
+                self._since_flush += 1
+                do_flush = self._since_flush >= self.flush_every
+            if do_flush:
+                self.flush()  # crash-safety only; correctness comes from close()/atexit
+        except Exception as exc:
+            self._note_error(subscripts, exc)
 
-    def _flush(self) -> None:
-        # Rewrite the whole file: the corpus is small (hundreds of unique
-        # signatures) and this keeps counts current without a second pass.
-        with open(self.path, "w") as fh:
-            for sig in self._seen.values():
-                fh.write(json.dumps(sig) + "\n")
+    def _note_error(self, subscripts, exc) -> None:
+        with self._lock:
+            first = not self.errors
+            self.errors.append({"subscripts": repr(subscripts)[:120],
+                                "error": f"{type(exc).__name__}: {exc}"})
+        if first:
+            print(f"[pycc.ef_capture] WARNING: signature capture error (further errors "
+                  f"collected in {self.path}.errors): {type(exc).__name__}: {exc}",
+                  file=sys.stderr)
+
+    def flush(self) -> None:
+        with self._lock:
+            self._since_flush = 0
+            tmp = self.path + ".tmp"
+            with open(tmp, "w") as fh:
+                for sig in self._seen.values():
+                    fh.write(json.dumps(sig) + "\n")
+            os.replace(tmp, self.path)  # atomic; a crash mid-write can't truncate the file
+            if self.errors:
+                with open(self.path + ".errors", "w") as fh:
+                    for e in self.errors:
+                        fh.write(json.dumps(e) + "\n")
+
+    def close(self) -> None:
+        self.flush()
 
 
 _recorder = None
@@ -117,7 +152,8 @@ def maybe_record(subscripts: str, operands) -> None:
     """Record a signature iff ``PYCC_EF_CAPTURE`` names an output path.
 
     Called from the hot contraction path; the env lookup + lazy singleton keep the
-    disabled case to one dict/attr check.
+    disabled case to one dict/attr check. The singleton's :meth:`SignatureRecorder.close`
+    is registered with :mod:`atexit` so final counts persist at interpreter exit.
     """
     path = os.environ.get("PYCC_EF_CAPTURE")
     if not path:
@@ -127,4 +163,5 @@ def maybe_record(subscripts: str, operands) -> None:
         with _recorder_lock:
             if _recorder is None or _recorder.path != path:
                 _recorder = SignatureRecorder(path)
+                atexit.register(_recorder.close)
     _recorder.record(subscripts, operands)

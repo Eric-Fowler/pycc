@@ -85,6 +85,49 @@ def test_uppercase_and_whitespace_specs():
     assert np.allclose(got, np.einsum("E,F,mEF->m", *ops))
 
 
+def _load_capture_module():
+    import importlib.util
+    p = pathlib.Path(__file__).resolve().parents[3] / "pycc" / "ef_capture.py"
+    spec = importlib.util.spec_from_file_location("pycc_ef_capture_test", p)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+def test_recorder_persists_final_counts(tmp_path):
+    """Regression: occurrences after the last NEW signature must still be counted."""
+    m = _load_capture_module()
+    import json
+    out = str(tmp_path / "sigs.jsonl")
+    rec = m.SignatureRecorder(out, flush_every=10_000)  # no batch flush; rely on close()
+    a = np.zeros((3, 4))
+    b = np.zeros((5,))
+    rec.record("ij,jk->ik", [a, np.zeros((4, 2))])   # signature A, first seen
+    rec.record("i->", [b])                            # signature B, first seen (last new one)
+    for _ in range(100):
+        rec.record("ij,jk->ik", [a, np.zeros((4, 2))])  # A repeated after B discovered
+    rec.close()
+    counts = {}
+    with open(out) as fh:
+        for line in fh:
+            s = json.loads(line)
+            counts[s["clean_spec"]] = s["count"]
+    assert counts["ij,jk->ik"] == 101   # would be 1 under the old flush-on-new-signature bug
+    assert counts["i->"] == 1
+
+
+def test_recorder_surfaces_errors(tmp_path):
+    m = _load_capture_module()
+    import json
+    out = str(tmp_path / "sigs.jsonl")
+    rec = m.SignatureRecorder(out)
+    rec.record(123, [np.zeros((2, 2))])   # non-str subscripts -> signature() raises; must be caught
+    rec.close()
+    assert rec.errors                      # error captured, not silently swallowed
+    with open(out + ".errors") as fh:
+        assert fh.read().strip()           # written to the sidecar
+
+
 @pytest.mark.parametrize("spec,shapes", [
     ("ia,ia->", [(4, 3), (4, 3)]),
     ("ijab,ijab->", [(4, 4, 3, 3), (4, 4, 3, 3)]),

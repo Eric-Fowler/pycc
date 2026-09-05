@@ -1,57 +1,97 @@
-"""Static inventory of PyCC's ``contract('...')`` einsum corpus.
+"""AST inventory of PyCC's ``contract(...)`` einsum corpus.
 
 Complements the runtime capture (which needs a live CCSD run, hence psi4): this
-parses string-literal specs straight from the sources, so the *index-pattern*
-corpus and the implicit-output question can be answered without running anything.
-~1900 of ~1950 ``contract(`` occurrences use a literal spec; the rest are
-docstring prose or the backend's own ``opt_einsum.contract(subscripts, ...)`` and
-are correctly skipped (no literal to parse).
+walks the AST of every source file, finds every call whose callee is ``contract``
+or ``*.contract``, and inspects argument zero. A spec counts as *literal* iff arg0
+is a string constant (``ast.Constant`` with a ``str`` value) — which covers single
+and double quotes and Python's implicit adjacent-string concatenation, and excludes
+f-strings, ``+`` concatenation, and variables. Non-literal calls are reported with
+source locations so they can be audited, not assumed away.
 
-Answers, per §4 A0:
-  * does any real spec omit ``->`` (implicit output)? -> invariant to assert;
-  * arity distribution, uppercase-index usage, whitespace-in-spec occurrences.
+This is what justifies A0 making implicit-output a hard adapter rejection: the claim
+"every literal spec spells ``->``" is only as strong as the scan behind it, so the
+scan must inspect the real argument, not a regex.
 
 Run:  python -m devtools.ef_integration.static_corpus  [pycc_dir]
 """
 
 from __future__ import annotations
 
+import ast
 import collections
 import pathlib
-import re
 import sys
 
-# contract('<spec>' ...  — a single-quoted first argument that looks like einsum
-_LITERAL = re.compile(r"contract\(\s*'([^']*)'")
-# a spec is einsum-ish if it is only letters/commas/arrow/spaces (excludes prose)
-_EINSUMISH = re.compile(r"^[A-Za-z,\->\s]+$")
+
+def _callee_name(func: ast.AST):
+    """'contract' for ``contract(...)`` and ``obj.contract(...)``; else None."""
+    if isinstance(func, ast.Name):
+        return func.id
+    if isinstance(func, ast.Attribute):
+        return func.attr
+    return None
 
 
-def iter_specs(pycc_dir: pathlib.Path):
+def _literal_str(node: ast.AST):
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    return None
+
+
+def _looks_einsum(spec: str) -> bool:
+    # an einsum spec is letters/commas/arrow/space only, and names >=1 operand term
+    body = "".join(spec.split())
+    if not body:
+        return False
+    if not all(c.isalpha() or c in ",->" for c in body):
+        return False
+    return ("," in body) or ("->" in body)
+
+
+def iter_contract_calls(pycc_dir: pathlib.Path):
+    """Yield (arg0_literal_or_None, is_einsum, spec_or_repr, file, line) per call."""
     for path in sorted(pycc_dir.rglob("*.py")):
-        if "ef_capture.py" in path.name:
+        if path.name == "ef_capture.py":
             continue
-        text = path.read_text(encoding="utf-8", errors="replace")
-        for m in _LITERAL.finditer(text):
-            spec = m.group(1)
-            if "," not in spec and "->" not in spec:
-                continue  # not an einsum spec (e.g. a device string)
-            if not _EINSUMISH.match(spec):
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+        except SyntaxError:
+            continue
+        rel = str(path.relative_to(pycc_dir.parent))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or _callee_name(node.func) != "contract":
                 continue
-            line = text.count("\n", 0, m.start()) + 1
-            yield spec, str(path.relative_to(pycc_dir.parent)), line
+            if not node.args:
+                # contract() with no positional args (e.g. the backend's own **-forwarding
+                # or an unrelated method) — record as non-literal for auditing
+                yield None, False, "<no-args>", rel, node.lineno
+                continue
+            lit = _literal_str(node.args[0])
+            if lit is None:
+                yield None, False, ast.dump(node.args[0])[:60], rel, node.lineno
+            else:
+                yield lit, _looks_einsum(lit), lit, rel, node.lineno
 
 
 def inventory(pycc_dir: pathlib.Path) -> dict:
-    specs = list(iter_specs(pycc_dir))
-    implicit = [(s, f, ln) for (s, f, ln) in specs if "->" not in s]
-    with_space = [(s, f, ln) for (s, f, ln) in specs if s != "".join(s.split())]
-    uppercase = [(s, f, ln) for (s, f, ln) in specs if any(c.isupper() for c in s)]
-    arity = collections.Counter(s.split("->")[0].count(",") + 1 for (s, _, _) in specs)
-    distinct = sorted({"".join(s.split()) for (s, _, _) in specs})
+    calls = list(iter_contract_calls(pycc_dir))
+    einsum_lits = [(s, f, ln) for (lit, isk, s, f, ln) in calls if lit is not None and isk]
+    nonliteral = [(s, f, ln) for (lit, isk, s, f, ln) in calls if lit is None]
+    nonein_lit = [(s, f, ln) for (lit, isk, s, f, ln) in calls
+                  if lit is not None and not isk]  # literal but not einsum (e.g. a device str)
+    implicit = [(s, f, ln) for (s, f, ln) in einsum_lits if "->" not in s]
+    with_space = [(s, f, ln) for (s, f, ln) in einsum_lits if s != "".join(s.split())]
+    uppercase = [(s, f, ln) for (s, f, ln) in einsum_lits if any(c.isupper() for c in s)]
+    arity = collections.Counter(s.split("->")[0].count(",") + 1 for (s, _, _) in einsum_lits)
+    distinct = sorted({"".join(s.split()) for (s, _, _) in einsum_lits})
     return {
-        "n_occurrences": len(specs),
+        "n_contract_calls": len(calls),
+        "n_einsum_literal": len(einsum_lits),
+        "n_nonliteral": len(nonliteral),
+        "n_literal_noneinsum": len(nonein_lit),
         "n_distinct": len(distinct),
+        "nonliteral": nonliteral,
+        "literal_noneinsum": nonein_lit,
         "implicit_output": implicit,
         "with_whitespace": with_space,
         "uppercase_index": uppercase,
@@ -64,21 +104,23 @@ def main(argv=None) -> int:
     argv = argv if argv is not None else sys.argv[1:]
     pycc_dir = pathlib.Path(argv[0]) if argv else pathlib.Path(__file__).resolve().parents[2] / "pycc"
     inv = inventory(pycc_dir)
-    print(f"contract('...') literal einsum specs: {inv['n_occurrences']} occurrences, "
-          f"{inv['n_distinct']} distinct")
-    print(f"arity (operands -> count): {inv['arity_hist']}")
-    print(f"specs using uppercase indices: {len(inv['uppercase_index'])} "
-          f"(e.g. {inv['uppercase_index'][0][0] if inv['uppercase_index'] else '-'})")
-    print(f"specs written with whitespace: {len(inv['with_whitespace'])} "
-          f"(e.g. {inv['with_whitespace'][0][0] if inv['with_whitespace'] else '-'})")
+    print(f"contract() call expressions        : {inv['n_contract_calls']}")
+    print(f"  literal einsum-spec calls        : {inv['n_einsum_literal']}  ({inv['n_distinct']} distinct)")
+    print(f"  literal non-einsum first arg      : {inv['n_literal_noneinsum']}")
+    print(f"  NON-literal first arg (audit)    : {inv['n_nonliteral']}")
+    print(f"arity (operands -> count)          : {inv['arity_hist']}")
+    print(f"uppercase-index specs              : {len(inv['uppercase_index'])}")
+    print(f"whitespace-in-spec specs           : {len(inv['with_whitespace'])}")
+    if inv["nonliteral"]:
+        print("non-literal contract() calls (audit these — not assumed prose/backend):")
+        for s, f, ln in inv["nonliteral"]:
+            print(f"    {f}:{ln}  {s}")
     if inv["implicit_output"]:
-        print(f"IMPLICIT-OUTPUT specs found: {len(inv['implicit_output'])} — "
-              f"invariant DOES NOT HOLD; adapter must normalize implicit semantics:")
+        print(f"IMPLICIT-OUTPUT literal specs: {len(inv['implicit_output'])} — invariant FAILS:")
         for s, f, ln in inv["implicit_output"][:20]:
             print(f"    {f}:{ln}  {s!r}")
     else:
-        print("INVARIANT HOLDS: every literal contract() spec spells '->' (explicit output). "
-              "The adapter may reject implicit-output specs loudly.")
+        print("INVARIANT HOLDS: every literal einsum contract() spec spells '->' (explicit output).")
     return 0
 
 
