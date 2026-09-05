@@ -21,6 +21,7 @@ transiently during RT-CC propagation; :class:`ContractionBackend` and
 
 from __future__ import annotations
 
+import os
 import warnings
 
 import numpy as np
@@ -64,6 +65,12 @@ class ContractionBackend(object):
     def __call__(self, subscripts, *operands):
         """Contract ``operands`` per ``subscripts`` (numpy.einsum format),
         returning an ndarray (CPU) or torch.Tensor (GPU)."""
+        if os.environ.get('PYCC_EF_CAPTURE'):
+            # A0 (ehrenfest integration, Track A): record the contraction signature
+            # for offline replay against ef. Off unless PYCC_EF_CAPTURE names a path;
+            # never perturbs the returned value and never raises into the caller.
+            from . import ef_capture
+            ef_capture.maybe_record(subscripts, operands)
         if self.device == 'CPU':
             return opt_einsum.contract(subscripts, *operands)
         elif self.device == 'GPU':
