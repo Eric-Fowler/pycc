@@ -105,16 +105,23 @@ Four contract points it gets right:
 
 ## B1a-memory (`bench_mem.py`) — separate deliverable
 Memory is measured apart from the timing ratio, with two quantities never conflated:
-- **Observed incremental peak RSS** — a `psutil` process-RSS sampler (stabilized
+- **Observed incremental peak RSS** — a `psutil` process-RSS *sampler* (stabilized
   baseline → sampled peak → incremental) that catches NumPy *native* allocations
-  (`tracemalloc` alone does not). PyCC and EF are each measured in a **fresh spawned
-  subprocess** so one implementation's retained allocator/cache state isn't charged
-  to the other. Fails closed without psutil. The sampler is unit-tested here (it
-  catches an ~80 MB native allocation).
+  (`tracemalloc` alone does not). The sampler thread is started and has taken its
+  first reading **before** the baseline, so its own startup isn't charged to the
+  region. It is a *sampled* peak (a poll can miss a very short-lived allocation).
+  PyCC and EF are each measured in a **fresh spawned subprocess** so retained
+  allocator/cache state isn't cross-charged, and each runs under the **same explicit
+  thread policy** as the timing benchmark (`measure(threads=1)`, fail-closed without
+  threadpoolctl, in-force `threadpool_info` returned per child). Subprocess failure is
+  **bounded and loud** — an OOM-killed/crashed/silent child makes the parent raise
+  (pipe-EOF or `timeout`), never hang. Sampler + crash handling are unit-tested here.
 - **EF planned working-set** — from EF's *own* plan/schedule accounting, reported
-  **separately** from observed RSS. The exact accessor is resolved on a live machine
-  (`ef_planned_bytes` tries `run.budget()` and otherwise reports the quantity as
-  deferred rather than guessing).
+  **separately** and currently **deferred**: `ef_planned_bytes` returns `None` (with a
+  note) rather than guessing. It explicitly does **not** use `runner.budget()` — that
+  is remaining fit *capacity*, not the plan's requirement (with `capacity = 1<<32` it
+  would report ~4 GiB regardless of the real footprint). `ChainSchedule.resident_bytes`
+  is the starting point to resolve on a live machine.
 
 ## GPU / B2 note — do not canonize the B0 host boundary
 For B0 correctness, host-reading `R2` is useful (it lets the residual be compared

@@ -3,28 +3,34 @@
 Kept SEPARATE from the timing ratio (`bench_t2.py`) on purpose — timing and memory
 are distinct B1a deliverables. Two quantities, never conflated:
 
-* **Observed incremental peak RSS** — a process-RSS sampler (``psutil``), which
+* **Observed incremental peak RSS** — a process-RSS *sampler* (``psutil``), which
   catches NumPy's *native* allocations (``tracemalloc`` alone does not). Contract:
-  ``stabilized baseline RSS before region`` → ``peak sampled RSS during region`` →
-  ``incremental = peak - baseline``. PyCC and EF are each measured in a **fresh
-  subprocess** (spawn) so one implementation's retained allocator/cache state is not
-  charged to the other.
+  ``stabilized baseline RSS before region`` -> ``sampled peak RSS during region`` ->
+  ``incremental = peak - baseline``. It is a *sampled* peak (a polling sampler can
+  miss a very short-lived allocation between samples), not the exact OS high-water
+  mark. PyCC and EF are each measured in a **fresh subprocess** (spawn) so one
+  implementation's retained allocator/cache state is not charged to the other, and
+  each runs under the same explicit CPU-thread policy as the timing benchmark.
 * **EF planned memory** — what the compiled ``search=False`` plan says its CPU
-  resident/working-set requirement is, from EF's *own* plan/schedule accounting (not
-  a manual tensor-size estimate). The exact accessor is resolved on a live machine
-  (see ``ef_planned_bytes``); until then this field is reported as deferred, never as
-  equal to observed RSS.
+  resident/working-set requirement is, from EF's *own* plan/schedule accounting. This
+  is reported as **deferred** until the correct accessor is confirmed on a live
+  machine (see ``ef_planned_bytes``); it is never approximated from ``runner.budget()``
+  (that is remaining fit *capacity*, not the plan's requirement) or from a manual
+  tensor-size estimate.
 
-Requires ``psutil`` (and, for the region measurements, psi4). The core sampler is
-provider-agnostic and unit-tested on a numpy workload.
+Requires ``psutil`` (and, for the region measurements, psi4). The core sampler and
+the subprocess-failure handling are provider-agnostic and unit-tested.
 """
 
 from __future__ import annotations
 
 import gc
 import multiprocessing as mp
+import os
 import threading
 import time
+
+from .bench_t2 import threadpool_limits, threadpool_info, _HAVE_TPC  # single-source shim
 
 try:
     import psutil
@@ -40,48 +46,74 @@ def _rss() -> int:
 def sampled_peak_rss(fn, *, warmup: int = 1, interval: float = 5e-4) -> dict:
     """Run ``fn`` once and return its observed incremental peak RSS (bytes).
 
-    A background thread samples process RSS every ``interval`` s. ``warmup`` calls
-    (default 1) run first so import/allocator growth is in the baseline, isolating the
-    region's own incremental footprint. Requires psutil (fails closed).
+    A background thread samples process RSS every ``interval`` s. The sampler is
+    started and has taken its first reading BEFORE the baseline, so its own thread
+    stack/startup is in the baseline, not the region's incremental footprint.
+    ``warmup`` calls (default 1) run first so import/allocator growth is baselined.
+    Requires psutil (fails closed).
     """
     if not _HAVE_PSUTIL:
         raise RuntimeError("psutil is required for observed-RSS measurement")
     for _ in range(warmup):
         fn()
-    gc.collect()
-    baseline = _rss()
-    peak = baseline
+
+    ready = threading.Event()
+    armed = threading.Event()
     stop = threading.Event()
+    box = {"peak": 0}
 
     def sampler():
-        nonlocal peak
+        _rss()               # first read: pay the sampler's own startup before baseline
+        ready.set()
+        armed.wait()
         while not stop.is_set():
-            peak = max(peak, _rss())
+            box["peak"] = max(box["peak"], _rss())
             time.sleep(interval)
 
     t = threading.Thread(target=sampler, daemon=True)
     t.start()
+    ready.wait()
+    gc.collect()
+    baseline = _rss()
+    box["peak"] = baseline
+    armed.set()
     try:
         fn()
-        peak = max(peak, _rss())
+        box["peak"] = max(box["peak"], _rss())
     finally:
         stop.set()
         t.join()
-    return {"baseline_bytes": baseline, "peak_bytes": peak,
-            "incremental_peak_bytes": max(0, peak - baseline)}
+    return {"baseline_bytes": baseline, "peak_bytes": box["peak"],
+            "incremental_peak_bytes": max(0, box["peak"] - baseline)}
+
+
+def _measured_under_threads(fn, threads) -> dict:
+    """``sampled_peak_rss(fn)`` under an explicit CPU-thread policy; the in-force
+    ``threadpool_info`` is captured inside the context and returned. Fails closed if a
+    thread count is requested without threadpoolctl (same rule as bench_t2)."""
+    if threads is not None and not _HAVE_TPC:
+        raise RuntimeError(
+            "threadpoolctl is required for a controlled memory measurement; "
+            "pass threads=None for an uncontrolled diagnostic")
+    with threadpool_limits(limits=threads):
+        info = threadpool_info() if _HAVE_TPC else None
+        rss = sampled_peak_rss(fn)
+    rss["thread_policy"] = "controlled" if (threads is not None and _HAVE_TPC) else "uncontrolled"
+    rss["threads"] = threads
+    rss["threadpool_info"] = info
+    return rss
 
 
 # --- region builders (need psi4); each is measured in its own fresh subprocess ---
 
-def _pycc_region_target():
+def _pycc_region_target(threads=1):
     from .against_pycc import build_pycc_state
     from .bench_t2 import pycc_t2_region
     cc = build_pycc_state()
-    region = pycc_t2_region(cc)
-    return sampled_peak_rss(region)
+    return _measured_under_threads(pycc_t2_region(cc), threads)
 
 
-def _ef_slice_target(capacity: int):
+def _ef_slice_target(capacity=1 << 32, threads=1):
     import ehrenfest as ef
     from .against_pycc import build_pycc_state
     from .against_pycc_t2 import extract_inputs
@@ -91,23 +123,57 @@ def _ef_slice_target(capacity: int):
     sl = R2mod.build(int(cc.no), int(cc.nv), denom="dijab")
     run = ef.runner(capacity, device="cpu")
     sl.precompile(run, search=False)
-    return sampled_peak_rss(lambda: sl.execute(run, inp))
+    return _measured_under_threads(lambda: sl.execute(run, inp), threads)
 
 
-def _child(entry, kw, q):
+def _crash_target():  # test helper: die without returning a result
+    os._exit(1)
+
+
+def _echo_target(value=0):  # test helper: a normal child that returns a value
+    return value + 1
+
+
+def _child(entry, kw, conn):
     try:
-        q.put({"ok": True, "result": entry(**kw)})
+        conn.send({"ok": True, "result": entry(**kw)})
     except Exception as e:  # surface the failure to the parent
-        q.put({"ok": False, "error": f"{type(e).__name__}: {e}"})
+        try:
+            conn.send({"ok": False, "error": f"{type(e).__name__}: {e}"})
+        except Exception:
+            pass
+    finally:
+        conn.close()
 
 
-def run_isolated(entry, **kw) -> dict:
-    """Run ``entry(**kw)`` in a fresh spawned subprocess and return its result dict."""
+def run_isolated(entry, timeout: float = 180.0, **kw) -> dict:
+    """Run ``entry(**kw)`` in a fresh spawned subprocess and return its result dict.
+
+    Bounded and loud: a child that is OOM-killed / segfaults / exits without sending
+    is detected via pipe EOF (not a hang), and a wedged child is terminated after
+    ``timeout``. Never blocks forever in ``recv``."""
     ctx = mp.get_context("spawn")
-    q = ctx.Queue()
-    p = ctx.Process(target=_child, args=(entry, kw, q))
+    recv_conn, send_conn = ctx.Pipe(duplex=False)
+    p = ctx.Process(target=_child, args=(entry, kw, send_conn))
     p.start()
-    out = q.get()
+    send_conn.close()   # parent is not a writer -> child death reaches us as EOF
+    try:
+        if not recv_conn.poll(timeout):
+            p.join(0)
+            if p.is_alive():
+                p.terminate()
+                p.join()
+                raise RuntimeError(f"memory measurement timed out after {timeout}s")
+            raise RuntimeError(
+                f"memory-measurement child exited {p.exitcode} without returning a result")
+        try:
+            out = recv_conn.recv()
+        except EOFError:
+            p.join()
+            raise RuntimeError(
+                f"memory-measurement child exited {p.exitcode} without returning a result")
+    finally:
+        recv_conn.close()
     p.join()
     if not out["ok"]:
         raise RuntimeError(f"isolated measurement failed: {out['error']}")
@@ -115,31 +181,30 @@ def run_isolated(entry, **kw) -> dict:
 
 
 def ef_planned_bytes(run) -> dict:
-    """Best-effort EF planned working-set from the runner's own accounting.
+    """EF planned working-set — DEFERRED.
 
-    The exact accessor is confirmed on a live machine; this tries a known candidate
-    and otherwise reports the quantity as deferred (never guessed, never conflated
-    with observed RSS)."""
-    budget = getattr(run, "budget", None)
-    if callable(budget):
-        try:
-            return {"planned_bytes": float(budget()), "source": "run.budget()"}
-        except Exception as e:
-            return {"planned_bytes": None, "note": f"run.budget() raised: {type(e).__name__}: {e}"}
+    Not derived from ``runner.budget()`` (that is remaining fit *capacity*, not the
+    plan's requirement) nor from manual tensor sizes. EF does expose real schedule
+    accounting (e.g. ``ChainSchedule.resident_bytes()`` — the peak device-node bytes
+    ``fits`` checks), but the composed-program-level accessor that also captures the
+    retained cut/deposit terms for this CPU program must be confirmed on a live
+    machine before it is reported. Until then this returns deferred."""
     return {"planned_bytes": None,
-            "note": "EF plan-accounting accessor not resolved; fill in on a live machine"}
+            "note": "EF plan/schedule accounting accessor not yet resolved on the pinned "
+                    "commit; resolve on a live machine (ChainSchedule.resident_bytes is the "
+                    "starting point). Do NOT use runner.budget() — that is remaining capacity."}
 
 
-def measure(capacity: int = 1 << 32) -> dict:
+def measure(capacity: int = 1 << 32, threads: int | None = 1, timeout: float = 180.0) -> dict:
     """Observed incremental peak RSS for the PyCC region and the EF slice, each in a
-    fresh subprocess. Gated on psi4 in the children; the timing gate/authority is
-    bench_t2/against_pycc_t2, not this module."""
+    fresh subprocess under the same thread policy. Gated on psi4 in the children."""
     return {
-        "pycc_region": run_isolated(_pycc_region_target),
-        "ef_slice": run_isolated(_ef_slice_target, capacity=capacity),
-        "ef_planned": "deferred — see ef_planned_bytes (resolve accessor on a live machine)",
-        "note": "observed incremental peak RSS (psutil), PyCC and EF isolated in fresh "
-                "subprocesses; separate from timing and from EF planned memory.",
+        "pycc_region": run_isolated(_pycc_region_target, timeout=timeout, threads=threads),
+        "ef_slice": run_isolated(_ef_slice_target, timeout=timeout, capacity=capacity, threads=threads),
+        "ef_planned": ef_planned_bytes(None),
+        "note": "observed incremental peak RSS (psutil, sampled), PyCC and EF isolated in "
+                "fresh subprocesses under one thread policy; separate from timing and from EF "
+                "planned memory (deferred).",
     }
 
 
