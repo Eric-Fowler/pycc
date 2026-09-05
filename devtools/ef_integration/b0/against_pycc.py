@@ -22,11 +22,18 @@ import numpy as np
 
 
 def build_pycc_state(geometry: str | None = None, basis: str = "cc-pVDZ", maxiter: int = 3):
-    """A deterministic PyCC CCSD ``ccwfn`` with a non-trivial (t1, t2).
+    """A deterministic finite-Jacobi-iteration CCSD state; convergence and DIIS
+    deliberately disabled/irrelevant.
 
-    ``maxiter`` is small on purpose: we want a fixed, reproducible amplitude state,
-    not convergence. (Canonical RHF has F[o,v]=0, so the MP2 seed gives t1=0; a few
-    iterations make the T1 residual a meaningful test.)
+    B0 is about one fixed *algebraic* state, not solver acceleration, so DIIS is
+    turned off (``max_diis=0``) and the loop is stopped after a few plain Jacobi
+    steps (``maxiter`` small) — the point is a reproducible ``(t1, t2)`` decoupled
+    from DIIS history, easy to reason about when a residual mismatch is being
+    debugged, and reusable verbatim by the T2 comparison. Canonical RHF has
+    F[o,v]=0 (so the MP2 seed gives t1=0); a few Jacobi steps make t1 non-trivial.
+
+    ``solve_cc`` returns the energy and mutates ``cc.t1``/``cc.t2`` in place; we do
+    not depend on its return value — the mutated amplitudes are the state we need.
     """
     import psi4
     import pycc
@@ -40,7 +47,7 @@ def build_pycc_state(geometry: str | None = None, basis: str = "cc-pVDZ", maxite
                       "d_convergence": 1e-10})
     _, wfn = psi4.energy("SCF", return_wfn=True)
     cc = pycc.CCwfn(wfn, model="CCSD")
-    cc.solve_cc(e_conv=1e-8, r_conv=1e-7, maxiter=maxiter)
+    cc.solve_cc(e_conv=1e-8, r_conv=1e-7, maxiter=maxiter, max_diis=0)  # DIIS off: fixed Jacobi state
     return cc
 
 

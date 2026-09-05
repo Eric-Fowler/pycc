@@ -48,16 +48,23 @@ def _looks_einsum(spec: str) -> bool:
     return ("," in body) or ("->" in body)
 
 
-def iter_contract_calls(pycc_dir: pathlib.Path):
-    """Yield (arg0_literal_or_None, is_einsum, spec_or_repr, file, line) per call."""
+def iter_contract_calls(pycc_dir: pathlib.Path, parse_errors: list | None = None):
+    """Yield (arg0_literal_or_None, is_einsum, spec_or_repr, file, line) per call.
+
+    Any file that fails to parse is appended to ``parse_errors`` (if given) rather
+    than silently skipped — the "whole corpus is accounted for" claim only holds if
+    no source file was skipped, so parse failures must be visible.
+    """
     for path in sorted(pycc_dir.rglob("*.py")):
         if path.name == "ef_capture.py":
             continue
+        rel = str(path.relative_to(pycc_dir.parent))
         try:
             tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
-        except SyntaxError:
+        except SyntaxError as e:
+            if parse_errors is not None:
+                parse_errors.append((rel, f"{type(e).__name__}: {e}"))
             continue
-        rel = str(path.relative_to(pycc_dir.parent))
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call) or _callee_name(node.func) != "contract":
                 continue
@@ -74,7 +81,8 @@ def iter_contract_calls(pycc_dir: pathlib.Path):
 
 
 def inventory(pycc_dir: pathlib.Path) -> dict:
-    calls = list(iter_contract_calls(pycc_dir))
+    parse_errors: list = []
+    calls = list(iter_contract_calls(pycc_dir, parse_errors))
     einsum_lits = [(s, f, ln) for (lit, isk, s, f, ln) in calls if lit is not None and isk]
     nonliteral = [(s, f, ln) for (lit, isk, s, f, ln) in calls if lit is None]
     nonein_lit = [(s, f, ln) for (lit, isk, s, f, ln) in calls
@@ -97,6 +105,7 @@ def inventory(pycc_dir: pathlib.Path) -> dict:
         "uppercase_index": uppercase,
         "arity_hist": dict(sorted(arity.items())),
         "distinct_specs": distinct,
+        "parse_errors": parse_errors,
     }
 
 
@@ -104,6 +113,7 @@ def main(argv=None) -> int:
     argv = argv if argv is not None else sys.argv[1:]
     pycc_dir = pathlib.Path(argv[0]) if argv else pathlib.Path(__file__).resolve().parents[2] / "pycc"
     inv = inventory(pycc_dir)
+    print(f"source files with PARSE ERRORS     : {len(inv['parse_errors'])}")
     print(f"contract() call expressions        : {inv['n_contract_calls']}")
     print(f"  literal einsum-spec calls        : {inv['n_einsum_literal']}  ({inv['n_distinct']} distinct)")
     print(f"  literal non-einsum first arg      : {inv['n_literal_noneinsum']}")
@@ -121,6 +131,11 @@ def main(argv=None) -> int:
             print(f"    {f}:{ln}  {s!r}")
     else:
         print("INVARIANT HOLDS: every literal einsum contract() spec spells '->' (explicit output).")
+    if inv["parse_errors"]:
+        print("PARSE ERRORS (files NOT inspected — corpus not fully accounted for):")
+        for f, e in inv["parse_errors"]:
+            print(f"    {f}: {e}")
+        return 1   # fail the command: the invariant's precondition is broken
     return 0
 
 

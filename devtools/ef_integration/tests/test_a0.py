@@ -85,6 +85,17 @@ def test_uppercase_and_whitespace_specs():
     assert np.allclose(got, np.einsum("E,F,mEF->m", *ops))
 
 
+def test_static_inventory_clean_and_explicit_output():
+    from devtools.ef_integration.static_corpus import inventory
+    pycc_dir = pathlib.Path(__file__).resolve().parents[3] / "pycc"
+    inv = inventory(pycc_dir)
+    assert inv["parse_errors"] == []           # every source file parsed/inspected
+    assert inv["n_einsum_literal"] > 0
+    assert inv["implicit_output"] == []        # the invariant A0 relies on
+    # the only non-literal contract() first args are the backend's own forwarding
+    assert all("device.py" in f for _, f, _ in inv["nonliteral"])
+
+
 def _load_capture_module():
     import importlib.util
     p = pathlib.Path(__file__).resolve().parents[3] / "pycc" / "ef_capture.py"
