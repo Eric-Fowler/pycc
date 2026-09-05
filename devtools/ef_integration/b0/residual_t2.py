@@ -4,7 +4,8 @@ Track B (B0), the meaningful slice: unlike the T1 plumbing proof, the seven
 T2-dependent intermediates (``Fae``/``Fmi``/``Fme``/``Wmnij``/``Wmbej``/``Wmbje``/
 ``Zmbij``) are built INSIDE the single program as cuts (not received pre-
 materialized), so ehrenfest actually sees the intermediate-production region and
-its reuse/materialization choices. Only ``R2`` (the residual) and ``t2_trial`` are
+its reuse and the declared-cut materialization baseline (alternate materialize-vs-
+fuse choices are B1b / ``search=True``). Only ``R2`` (the residual) and ``t2_trial`` are
 host-read; the intermediates stay internal program values.
 
 Each PyCC term (``pycc/ccwfn.py`` ``_r_T2_ccsd`` and the ``build_*`` intermediates)

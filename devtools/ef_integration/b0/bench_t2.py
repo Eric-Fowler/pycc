@@ -93,10 +93,11 @@ def _timed(fn):
     return time.perf_counter() - t0
 
 
-def _env(threads, capacity):
+def _env(threads, thread_policy, controlled_info, capacity):
     info = {
+        "thread_policy": thread_policy,      # "controlled" or "uncontrolled"
         "threads": threads,
-        "threadpool_info": threadpool_info() if _HAVE_TPC else "threadpoolctl-unavailable",
+        "threadpool_info": controlled_info,  # captured INSIDE the limits context (in force during timing)
         "platform": platform.platform(),
         "numpy": np.__version__,
         "ef_pin": EF_PIN,
@@ -114,11 +115,22 @@ def benchmark(cc, capacity: int = 1 << 32, warm: int = 25, warmup: int = 3,
               threads: int | None = 1, rtol: float = 1e-9, atol: float = 1e-11) -> dict:
     """Run the B1a lifecycle-split benchmark against a live PyCC state.
 
-    Pins both timed sides to the production authority, then times under an explicit
-    thread policy with alternating EF/PyCC samples. Returns a report; correctness is
-    asserted (raises on mismatch) but not re-reported as the deliverable — the psi4
-    gate remains the authority.
+    Pins both timed sides to the production authority, then times EVERY numerical
+    phase (precompile, first execution, warm) under one explicit thread policy, with
+    alternating EF/PyCC samples. Correctness is asserted (raises on mismatch); the
+    psi4 gate remains the authority.
+
+    ``threads`` fixes the BLAS/OpenMP thread count for the timed section. It requires
+    ``threadpoolctl``: with ``threads`` set but threadpoolctl absent the harness fails
+    closed (a benchmark must not silently run uncontrolled while reporting a thread
+    count). Pass ``threads=None`` to request an explicit *uncontrolled* diagnostic run.
     """
+    if threads is not None and not _HAVE_TPC:
+        raise RuntimeError(
+            "threadpoolctl is required for a controlled B1a benchmark; "
+            "pass threads=None explicitly for an uncontrolled diagnostic run")
+    thread_policy = "controlled" if (threads is not None and _HAVE_TPC) else "uncontrolled"
+
     import ehrenfest as ef
     from . import residual_t2 as R2mod
     from .against_pycc_t2 import extract_inputs
@@ -128,7 +140,7 @@ def benchmark(cc, capacity: int = 1 << 32, warm: int = 25, warmup: int = 3,
 
     r2_auth, t2_auth = _authority(cc)
 
-    # --- comparator pinned to the authority (fix 2): pycc_t2_region == cc.residuals ---
+    # --- comparator pinned to the authority (untimed): pycc_t2_region == cc.residuals ---
     region = pycc_t2_region(cc)
     r2_reg, t2_reg = region()
     np.testing.assert_allclose(np.asarray(r2_reg), r2_auth, rtol=rtol, atol=atol,
@@ -136,33 +148,36 @@ def benchmark(cc, capacity: int = 1 << 32, warm: int = 25, warmup: int = 3,
     np.testing.assert_allclose(np.asarray(t2_reg), t2_auth, rtol=rtol, atol=atol,
                                err_msg="pycc_t2_region update != authority")
 
-    # --- EF lifecycle, timed in phases (fix 3), fairness build denom='dijab' (fix 1) ---
-    t0 = time.perf_counter()
-    sl = R2mod.build(o, v, denom="dijab")
-    ef_build = time.perf_counter() - t0
-
-    t0 = time.perf_counter()
-    run = ef.runner(capacity, device="cpu")
-    ef_runner_ctor = time.perf_counter() - t0
-
-    t0 = time.perf_counter()
-    sl.precompile(run, search=False)
-    ef_precompile = time.perf_counter() - t0
-
-    t0 = time.perf_counter()
-    r2_ef, t2_ef = sl.execute(run, inp)     # first (cold) execution
-    ef_first_exec = time.perf_counter() - t0
-
-    # EF slice pinned to the authority too (the exact graph being benchmarked)
-    np.testing.assert_allclose(np.asarray(r2_ef), r2_auth, rtol=rtol, atol=atol,
-                               err_msg="ef dijab-mode residual != authority")
-    np.testing.assert_allclose(np.asarray(t2_ef), t2_auth, rtol=rtol, atol=atol,
-                               err_msg="ef dijab-mode update != authority")
-
-    # --- warm timing: both warmed, then alternating timed samples (fix 4) ---
     ef_samples: list = []
     pycc_samples: list = []
+    # EVERY numerical-kernel phase runs under ONE thread policy; capture the in-force
+    # thread info INSIDE the context (threadpoolctl restores defaults on exit).
     with threadpool_limits(limits=threads):
+        controlled_info = threadpool_info() if _HAVE_TPC else None
+
+        t0 = time.perf_counter()
+        sl = R2mod.build(o, v, denom="dijab")            # fairness build (fix 1)
+        ef_build = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        run = ef.runner(capacity, device="cpu")
+        ef_runner_ctor = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        sl.precompile(run, search=False)
+        ef_precompile = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        r2_ef, t2_ef = sl.execute(run, inp)              # first (cold) execution
+        ef_first_exec = time.perf_counter() - t0
+
+        # the exact EF graph being benchmarked, pinned to the authority
+        np.testing.assert_allclose(np.asarray(r2_ef), r2_auth, rtol=rtol, atol=atol,
+                                   err_msg="ef dijab-mode residual != authority")
+        np.testing.assert_allclose(np.asarray(t2_ef), t2_auth, rtol=rtol, atol=atol,
+                                   err_msg="ef dijab-mode update != authority")
+
+        # warm both, then alternate timed samples (fix 4)
         for _ in range(warmup):
             sl.execute(run, inp)
             region()
@@ -182,7 +197,7 @@ def benchmark(cc, capacity: int = 1 << 32, warm: int = 25, warmup: int = 3,
     ef_d, pycc_d = dist(ef_samples), dist(pycc_samples)
     return {
         "shape": {"o": o, "v": v},
-        "environment": _env(threads, capacity),
+        "environment": _env(threads, thread_policy, controlled_info, capacity),
         "ef_build_s": ef_build,
         "ef_runner_ctor_s": ef_runner_ctor,
         "ef_precompile_s": ef_precompile,
@@ -190,9 +205,12 @@ def benchmark(cc, capacity: int = 1 << 32, warm: int = 25, warmup: int = 3,
         "ef_warm_s": ef_d,
         "pycc_t2_region_s": pycc_d,
         "warm_ratio_ef_over_pycc": ef_d["median"] / pycc_d["median"] if pycc_d["median"] else None,
+        "memory": "not measured here — see B1a-memory (bench_mem.py); timing and memory "
+                  "are separate deliverables",
         "note": "search=False declared-cut baseline; denom=dijab (precomputed cc.Dijab); "
-                "warm reuses one precompiled program; both sides pinned to cc.residuals(...)[1] "
-                "before timing. Interpret only after the psi4 production gate is green.",
+                "all numerical phases under one thread policy; warm reuses one precompiled "
+                "program; both sides pinned to cc.residuals(...)[1] before timing. Interpret "
+                "only after the psi4 production gate is green.",
     }
 
 

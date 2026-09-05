@@ -26,8 +26,10 @@ def test_bench_reports_lifecycle_fields():
     gate = compare_against_pycc(cc)      # production gate before any timing
     assert gate["residual_ok"] and gate["update_ok"]
 
-    rep = benchmark(cc, warm=3, pycc_warm=3)
+    rep = benchmark(cc, warm=4, threads=1)
     for key in ("ef_build_s", "ef_runner_ctor_s", "ef_precompile_s",
                 "ef_first_exec_s", "ef_warm_s", "pycc_t2_region_s",
-                "warm_ratio_ef_over_pycc"):
+                "warm_ratio_ef_over_pycc", "environment", "memory"):
         assert key in rep
+    assert rep["environment"]["thread_policy"] == "controlled"
+    assert rep["environment"]["threads"] == 1

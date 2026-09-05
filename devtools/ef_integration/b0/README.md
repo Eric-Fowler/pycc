@@ -94,12 +94,27 @@ Four contract points it gets right:
   construction, `precompile(search=False)`, first (cold) execute, and a **warm loop
   that reuses the same Slice/program/runner/precompiled plan** (no rebuild, no
   precompile). Only the warm distribution is compared.
-- **Thread policy + fair sampling:** the timed section runs under an explicit
-  `threadpool_limits(threads)` (default 1) and the report records threads,
-  `threadpool_info`, platform, numpy/opt_einsum versions, the EF pin and capacity, so
-  a ratio isn't secretly a thread-runtime artifact. EF and PyCC are both warmed, then
-  their timed samples **alternate order** to avoid fixed-order thermal/frequency bias;
-  the raw samples + quartiles are kept in the report.
+- **Thread policy + fair sampling:** **every** numerical-kernel phase (precompile,
+  cold, warm) runs under one explicit `threadpool_limits(threads)` (default 1) — not
+  just the warm loop — and `threadpool_info` is captured **inside** that context (it
+  restores defaults on exit). It **fails closed** if a thread count is requested but
+  threadpoolctl is missing (pass `threads=None` for an explicit *uncontrolled*
+  diagnostic); the report tags `thread_policy` and records threads / platform /
+  numpy / opt_einsum / EF pin / capacity. EF and PyCC are both warmed, then their
+  timed samples **alternate order**; raw samples + quartiles are kept.
+
+## B1a-memory (`bench_mem.py`) — separate deliverable
+Memory is measured apart from the timing ratio, with two quantities never conflated:
+- **Observed incremental peak RSS** — a `psutil` process-RSS sampler (stabilized
+  baseline → sampled peak → incremental) that catches NumPy *native* allocations
+  (`tracemalloc` alone does not). PyCC and EF are each measured in a **fresh spawned
+  subprocess** so one implementation's retained allocator/cache state isn't charged
+  to the other. Fails closed without psutil. The sampler is unit-tested here (it
+  catches an ~80 MB native allocation).
+- **EF planned working-set** — from EF's *own* plan/schedule accounting, reported
+  **separately** from observed RSS. The exact accessor is resolved on a live machine
+  (`ef_planned_bytes` tries `run.budget()` and otherwise reports the quantity as
+  deferred rather than guessing).
 
 ## GPU / B2 note — do not canonize the B0 host boundary
 For B0 correctness, host-reading `R2` is useful (it lets the residual be compared
@@ -112,5 +127,7 @@ intended final GPU integration contract.
 ## Not yet done (next B0/B1 steps)
 - Execute the production comparisons (`against_pycc.py`, `against_pycc_t2.py`) on a
   psi4 machine — the gate before any B1a interpretation.
-- Run `bench_t2.py` (after the gate) and report the lifecycle-split numbers.
+- Run `bench_t2.py` (after the gate) → the timing baseline.
+- Run `bench_mem.py` (B1a-memory) → observed peak RSS; resolve the EF planned-memory
+  accessor on the live machine.
 - B1b optional `search=True` experiment, reported separately.

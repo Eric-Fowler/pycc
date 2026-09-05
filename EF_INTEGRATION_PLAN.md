@@ -258,11 +258,20 @@ import/adapt EF's t1-dressed DF-CCSD graph and call it the PyCC experiment.
   denominator construction PyCC never repeats (`denom="eps"` stays the correctness build). Break out, as
   separate phases (never one opaque `Slice.run` number): EF IR/program build, runner construction,
   `precompile`, first (cold) execution, and a warm loop that **reuses the same Slice/program/runner/
-  precompiled plan** (no rebuild, no precompile) — only the warm distribution is compared. Run the timed
-  section under an explicit `threadpool_limits(threads)` and record the CPU-thread policy + environment;
-  warm both sides then **alternate** timed samples. Report peak/planned memory separately where
-  trustworthy. Harness: `devtools/ef_integration/b0/bench_t2.py`, gated on the psi4 production comparison
-  being green before any number is interpreted.
+  precompiled plan** (no rebuild, no precompile) — only the warm distribution is compared. Run **every
+  numerical-kernel phase** (precompile, cold, warm) under one explicit `threadpool_limits(threads)`,
+  capture the in-force `threadpool_info` *inside* that context, and **fail closed** if a thread count is
+  requested without threadpoolctl; record the CPU-thread policy + environment; warm both sides then
+  **alternate** timed samples. B1a is a **timing baseline only**. Harness:
+  `devtools/ef_integration/b0/bench_t2.py`, gated on the psi4 production comparison being green before any
+  number is interpreted.
+- **B1a-memory.** Memory is a *separate* deliverable from the timing ratio, with two distinct quantities
+  never conflated: (a) **observed incremental peak RSS** via a `psutil` process-RSS sampler (catches
+  NumPy native allocations; `tracemalloc` alone does not) — stabilized-baseline → sampled-peak →
+  incremental, with PyCC and EF each measured in a **fresh subprocess** so retained allocator state isn't
+  cross-charged; (b) **EF planned working-set** from EF's *own* plan/schedule accounting (not a manual
+  tensor-size estimate), reported apart from (a). Harness: `devtools/ef_integration/b0/bench_mem.py`
+  (observed side implemented + unit-tested; the EF-planned accessor is resolved on a live machine).
 - **B1b.** *Optional* `search=True` experiment (the one that actually tests alternate
   materialize-vs-fuse decisions), reported **separately**, with search time and the resulting decision
   fingerprint recorded. (Persistence/amortization of that search is an upstream EF concern.)
