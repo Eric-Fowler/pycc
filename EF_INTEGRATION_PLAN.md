@@ -1,6 +1,10 @@
 # PyCC × ehrenfest (`ef`) integration plan
 
-**Status:** living document — iteration 3. Plan-only; no code beyond the reference adapter in §3.
+**Status:** iteration 3 — implementation in progress. A0 static/synthetic coverage implemented (AST
+corpus inventory + offline replay); live PyCC capture pending (needs psi4). B0 T1 plumbing slice
+implemented and checked against an independent numpy transcription of PyCC's T1 equations; the
+production-PyCC comparison is authored (`devtools/ef_integration/b0/against_pycc.py`) but not yet
+executed (needs psi4), so production-PyCC equivalence is not yet verified.
 **Constraint:** `ef` (the `ehrenfest` package) has ongoing work and is **not modified by this effort** —
 we integrate against `ef` *as it currently exists*. Gaps we hit are reported to the `ef` team, not
 patched here.
