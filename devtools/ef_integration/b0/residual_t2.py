@@ -58,14 +58,25 @@ class Slice:
         cut = self.inter[name]
         return _transposed(ef.evaluate(cut.node, self.arrays(inp)), cut.node, out_letters)
 
-    def run(self, inp: dict, run, search: bool = False):
-        arrays = self.arrays(inp)
+    def precompile(self, run, search: bool = False):
+        """Plan the program once (search=False is the frozen B0 baseline). Separated
+        from execute() so B1a can time build/precompile/first/warm phases apart and
+        never re-plan in the warm loop."""
         run.precompile(self.program, search=search)
+
+    def execute(self, run, inp: dict):
+        """One pass on an already-precompiled program: begin_pass + execute, no
+        planning. This is the per-residual-evaluation cost B1a's warm loop measures."""
+        arrays = self.arrays(inp)
         run.begin_pass(arrays)
         got = run.execute(through=self.t2_trial, arrays=arrays)
         r2 = _transposed(got[self.R2], self.R2.node, "ijab")
         t2t = _transposed(got[self.t2_trial], self.t2_trial, "ijab")
         return r2, t2t
+
+    def run(self, inp: dict, run, search: bool = False):
+        self.precompile(run, search=search)
+        return self.execute(run, inp)
 
     def evaluate_oracle(self, inp: dict):
         arrays = self.arrays(inp)

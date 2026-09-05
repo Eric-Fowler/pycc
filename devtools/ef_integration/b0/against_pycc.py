@@ -32,8 +32,11 @@ def build_pycc_state(geometry: str | None = None, basis: str = "cc-pVDZ", maxite
     debugged, and reusable verbatim by the T2 comparison. Canonical RHF has
     F[o,v]=0 (so the MP2 seed gives t1=0); a few Jacobi steps make t1 non-trivial.
 
-    ``solve_cc`` returns the energy and mutates ``cc.t1``/``cc.t2`` in place; we do
-    not depend on its return value — the mutated amplitudes are the state we need.
+    ``solve_cc`` mutates ``cc.t1``/``cc.t2`` in place; its return value is
+    deliberately ignored (for the intentionally non-converged finite-iteration case
+    it may fall off the end without returning an energy). The mutated amplitudes are
+    the state we need. With ``max_diis=0`` PyCC's DIIS returns the input amplitudes
+    unchanged, so the state is a pure finite-Jacobi one.
     """
     import psi4
     import pycc

@@ -243,13 +243,23 @@ import/adapt EF's t1-dressed DF-CCSD graph and call it the PyCC experiment.
   convergence.
 - **B0 planner mode is frozen.** The first B0 correctness/perf baseline uses EF's **declared/default
   program placement with planner search DISABLED** (`precompile(..., search=False)`), so two B0
-  implementations can't reach incomparable conclusions (one paying the ~239 s search, one not).
-- **B1a.** Cold/warm benchmark of that fixed `search=False` baseline — break out IR/node construction,
-  planning, compilation, first (cold) execution, warm execution, whole-iteration wall time, and peak
-  memory/transfers where available.
-- **B1b.** *Optional* `search=True` experiment, reported **separately**, with search time and the
-  resulting decision fingerprint recorded. (Persistence/amortization of that search is an upstream EF
-  concern, not a PyCC deliverable.)
+  implementations can't reach incomparable conclusions (one paying the ~239 s search, one not). Be
+  precise about what this baseline exposes: one composed forest, cross-expression CSE/shared work,
+  stable program order, intermediate reuse, residency/preload opportunities, and the **declared-cut
+  materialization baseline** (the default value of the materialize-vs-fuse DoF) — it does **not**
+  search materialize-vs-fuse, so a B1a result must not be credited to "EF's materialization optimizer".
+- **B1a.** Cold/warm benchmark of that fixed `search=False` baseline. **Comparator:** a *T2-only*
+  production PyCC region (`build_* → cc.r_T2 → t2 + r2/cc.Dijab` on `cc.contract`/opt_einsum), **not**
+  `cc.residuals()` (which also computes `r_T1` and would over-charge PyCC); `cc.r_T2` already
+  symmetrizes so it equals the authority `cc.residuals(...)[1]` while doing only T2 work. Break out, as
+  separate phases (never one opaque `Slice.run` number): EF IR/program build, runner construction,
+  `precompile`, first (cold) execution, and a warm loop that **reuses the same Slice/program/runner/
+  precompiled plan** (no rebuild, no precompile) — only the warm distribution is compared. Report peak/
+  planned memory separately where trustworthy. Harness: `devtools/ef_integration/b0/bench_t2.py`, gated
+  on the psi4 production comparison being green before any number is interpreted.
+- **B1b.** *Optional* `search=True` experiment (the one that actually tests alternate
+  materialize-vs-fuse decisions), reported **separately**, with search time and the resulting decision
+  fingerprint recorded. (Persistence/amortization of that search is an upstream EF concern.)
 - **B2.** Only after correctness, try an **EF-owned GPU execution path** for that region (§5).
 
 ---
@@ -368,13 +378,17 @@ must not be cited as a PyCC speedup. They justify running Track B; they do not p
 
 ---
 
-## 9. Open questions for the maintainers
-- **Track priority:** is the Track-B vertical slice (B0) worth doing *now*, in parallel with Track A?
-  (This plan argues yes — it is the only thing that answers the question that matters.)
-- **Where to cut the B0 slice:** which residual + update boundary is cleanest to express as one EF
-  program while remaining numerically checkable against current PyCC?
-- **Dependency/pinning:** confirm pin-to-commit (vs. waiting for an EF release) and how the CI env
-  obtains EF.
-- **RT-CC / local CC:** keep both on `opt_einsum` until EF grows complex-runner support and per-pair /
-  symbolic-extent tensors?
-- **GPU:** confirm the regional-handoff model (§5) over any per-call GPU substitution.
+## 9. Decisions (resolved with the maintainers)
+- **Track priority — resolved:** run Track A (harness) and Track B (program-native) in parallel; B0 is
+  the experiment that matters. Done for T1 (plumbing) and T2 (meaningful slice).
+- **Where to cut B0 — resolved:** T2 residual + `t2 += r2/Dijab`, with the seven intermediates produced
+  inside the program. Implemented (`devtools/ef_integration/b0/residual_t2.py`).
+- **Dependency/pinning — resolved:** `ef` stays **optional and lazy-imported**; the normal PyCC install
+  and test run must **not** require it; **no git submodule**; pin the integration/dev/CI environment to
+  the known-good `ehrenfest` commit **`da4d2d9`** until EF has a stable release/tag/API contract.
+- **RT-CC / local CC — resolved:** keep both on `opt_einsum` for now. RT-CC's `ef.runner` complex
+  execution is a *verified* blocker; local/PNO per-pair varying extents are not yet mapped to EF's
+  fixed-extent program model. Do **not** broaden Track A/B just to claim method coverage.
+- **GPU — resolved:** regional-handoff model (§5), not per-call GPU substitution; and the B0 host
+  boundary (`host-read R2 + t2_trial`) is a correctness convenience, **not** the final GPU contract —
+  a B2 handoff may form the Jacobi increment / RMS internally rather than crossing full `R2` back.
