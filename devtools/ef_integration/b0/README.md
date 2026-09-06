@@ -67,7 +67,15 @@ PYTHONPATH=/path/to/ehrenfest python -m pytest devtools/ef_integration/b0/tests/
     devtools/ef_integration/b0/tests/test_b0_t2_against_pycc.py -q
 # B1a benchmark (gated on the production comparison; needs psi4)
 PYTHONPATH=/path/to/ehrenfest python -m devtools.ef_integration.b0.bench_t2
+# ONE-COMMAND B1a report (gate -> timing -> memory, with SHAs/fixture stamped)
+PYTHONPATH=/path/to/ehrenfest python -m devtools.ef_integration.b0.run_b1a
 ```
+
+`run_b1a.py` is an **orchestration-only** report driver (no measurement logic of its
+own): it runs the production gate first, refuses timings unless it is green, then calls
+the frozen `bench_t2.benchmark` and `bench_mem.measure`, stamping the two live git SHAs
+and the molecule/basis/`(o,v)` fixture the harness does not itself emit — one JSON report
+with every B1a field. B1b (`search=True`) is a separate run, not driven here.
 
 ## B1a benchmark (`bench_t2.py`) — authored, gated
 The harness is written but its numbers must **not** be interpreted until the psi4
